@@ -491,3 +491,101 @@ env `HIP_KITTENS_DIR`），本仓库固定在 commit `d3cd9b31`。命名空间�
 阅读建议：先看 `art_base.cuh`（一个 art tile 怎么把 range 展开成 asm 操作数），
 再对照 `assembly/mma.cuh` 看一条 `mma_ABt` 最终吐出的 `v_mfma_f32_16x16x32_bf16`
 长什么样，之后回读 kernel 的 QK 循环会非常顺。
+
+---
+
+# 日志区（append-only，从这里往下当学习日志用）
+
+## 2026-08-27 Q&A：QK 乘完为什么能「立刻」softmax、立刻 PV？
+
+> 问题原文：s2r 读出来 q & k 然后相乘，然后直接就能 softmax 么？然后就能
+> p & v 相乘了么？我记得好像得算完所有 dim 求出来 online softmax 的那个
+> 最大值才行？为啥 p_tmp（p_comp）只用这么一点点就行？那么怎么求 row_max？
+
+### 1. 先拆掉一个概念混淆：softmax 归约的轴是 T，不是 dim=512
+
+S = Q·Kᵀ 有两类「维」，作用完全不同：
+
+- **dim = 512（head dim）**：这是 GEMM 的收缩轴（K 轴）。它在 softmax
+  之前就**必须也确实已经收完了**——QK 循环的 64 个子步（16 个 col-tile ×
+  4 个 row-group，kernel L663）就是在把 512 维一段段（每段 32）累进
+  p_comp。循环走完时，p_comp 里的每个数都是**完整**的
+  `Σ_{d=0..511} q_d·k_d`，没有任何「没算完的 dim」。
+- **T（KV token 数）**：这才是 softmax 求 max / 求和的轴。你记忆里的
+  「要先算完所有才能求 max」指的就是这条轴——而它正是 online softmax
+  要绕过去的东西。
+
+所以流水线顺序「QK → softmax → PV」在**单个 tile 内部**没有任何数学妥协：
+进入 softmax 时这 64 列分数每一个都是精确完整的。
+
+### 2. tile 之间：确实不知道全局 max，但不需要知道
+
+朴素 softmax 需要全局 `M = max_t s_t`。online softmax 的核心恒等式：
+
+```
+exp(s − M) = exp(s − m) · exp(m − M)      （对任意 m）
+```
+
+也就是说：用一个**暂时的、偏小的 max `m`** 先把 exp 算了、把 O 和分母都
+累了，将来发现真正的 max 更大时，只要给**已累加的整体**补乘一个
+`exp(m_old − m_new)`（就是 rescale `r`），结果和从头用全局 max 算**逐位
+相等**。这是线性性：O_acc 和 l 都是「每项带同一个因子」的和，因子错了就
+整体乘一次修正。
+
+每行跨 tile 只需要 3 个存活量：`m`（running max）、`l`（row_sum_e，分母）、
+`O_acc`（oaccu，分子）。每来一个 64 列 tile：
+
+```
+m_new = max(m, rowmax(S_tile))          # 只看本 tile 64 列 + 旧 m
+r     = exp(m − m_new)
+O_acc = O_acc·r + exp(S_tile − m_new)·V_tile
+l     = l·r     + rowsum(exp(S_tile − m_new))
+```
+
+**数值例子**（一行、两 tile、每 tile 2 列）：分数 tile1 = [1, 3]，
+tile2 = [5, 2]，全局 max 其实是 5。
+
+- tile1 结束：m=3，l = e⁻² + 1，O_acc = e⁻²·v₁ + 1·v₂。
+  （这里 v₂ 的权重 1 是「错的」，真值该是 e⁻²——先欠着。）
+- tile2：local max = 5 > 3 → m_new = 5，r = e⁻²。
+  O_acc = **e⁻²**·(e⁻²·v₁ + v₂) + 1·v₃ + e⁻³·v₄
+        = e⁻⁴·v₁ + e⁻²·v₂ + 1·v₃ + e⁻³·v₄ ← 和全局 max=5 直接算完全一致。
+  l 同理。之前「欠」的因子被 r 一次性补齐。
+
+这就是「为什么敢立刻 softmax、立刻 PV」：PV 乘进去的 P 可能带着偏小的
+max，但未来的 rescale 会把**整个 oaccu**修正回来。本 kernel 还把这个
+rescale 乘法拆成对儿塞在 PV 的相邻 mfma 之间（common 头 L303），零额外
+暴露时间。
+
+### 3. 为什么 p_comp 这么小就够
+
+因为 S 的生命周期只有「一个 tile 内」：本 tile 64 列分数 → 原地 exp →
+pack bf16 → PV 吃掉 → 灭。跨 tile 存活的只有 O_acc（128 个 VGPR）+
+m、l（各 1 个标量寄存器）。[16, T] 的完整 S 从不存在。
+p_comp = 64 列 × 16 行 ÷ 64 lane = 16 VGPR，正好一个 tile。
+
+### 4. row_max 具体怎么求（本 kernel 三步，L786–817）
+
+回忆 lane 布局：lane l 持有 q 行 = l%16、本 tile 里 16 个 KV 列
+（4 列一组、组间隔 16）。
+
+1. **lane 内**：`max_16<>()` 对自己 16 个 p_comp 寄存器求 max
+   → 该 lane 覆盖的 16 列的局部 max（纯 VALU，无跨线程）。
+2. **lane 间**：`warp_reduce<MaxFunctor>`，只在
+   {l, l+16, l+32, l+48} 这 4 个 lane 之间归约（stop_stride=15，
+   swizzle 实现）——这 4 个 lane 正好持有**同一 q 行**的 4 份 16 列
+   → 得到本 tile 完整 64 列的 `local_max`，且 4 个 lane 各留一份副本。
+3. **和 running max 合并**：
+   - 首 iter：`row_max = local_max`，无 rescale；
+   - 否则：`local_max − row_max > 8.0`（kRescaleThreshold）才认为需要
+     rescale，且用 `ballot` 升格成整个 wave 的一致决定（因为 oaccu 的
+     rescale 是全 wave 一起做的寄存器扫乘）；不超阈值就**故意用旧的
+     （偏小的）row_max 接着算**——exp(s − 旧max) 最多偏大 e⁸ ≈ 2981 倍，
+     离 fp32 的 e⁸⁸ 溢出墙很远，而分子分母用的是同一个 m，数学上仍然
+     精确，只是省掉了那次全 oaccu 扫乘（长上下文实测 ~3%）。
+
+一句话总结：**dim 轴在 mfma 累加里早就收完了；T 轴不需要先看全局，
+online softmax 用「先欠账、后补乘」把它变成了流式的**——所以 QK 一完就能
+softmax，softmax 一完就能 PV，p_comp 只需要装一个 tile。
+
+→ 深挖：spec Ch.9（softmax 各函数逐行）、Ch.10.4.1（kDoRescale 两种实例）。
