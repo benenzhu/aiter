@@ -184,32 +184,66 @@ v 35┐
 v  0┘
 ```
 
-我们来算一下预先分配的这些寄存器都是做什么的. 
+我们来算一下预先分配的这些寄存器都是做什么的.
 
-1. oaccu `128/thread` -> `16 * 512 / warp` -> `128 * 512 / cta`
+**先把 shape 流写出来**（一个 work item 的逻辑视角）：
 
-是PV的累加结果.
-
-``` python
-cta：[128, 512]
-warp0: [:16, :512]
-分配给thread需要注意, 我们的矩阵乘会用[16x16x32]吧应该是
-t0: [：4，0] 正常情况下, 这里如果swap了 a/b就是 [0,:4].. 然后x+=16 until 128
 ```
-首先 输入的 Q:[h=128, dim=512] @ K[dim=512, T=128] @ V[T=128, dim=512] 出来就是[128,512]的shape.
+Q[128, 512] @ Kᵀ[512, T] → S[128, T] → P = softmax(S)
+P[128, T] @ V[T, 512] → O[128, 512]
+```
 
-?? o_running是什么？
+128 = H × qseqlen（M 维）；**T 不是 128**，它是本 work item 的 KV 长度
+（任意长的上下文），被切成 kBlockN=64 行一个的 tile 逐个消化。「逐个消化」
+正是下面第 2、3 条的答案。
 
-`O_running = Σ_tile exp(S − row_max)·V`，跨 KV tile 一直累加（偶尔乘
-rescale），epilogue 才除以 `row_sum_e`。每个 warp 只管自己 16 行 Q：
-PV 的 D 循环按「一对 (oaccu_a, oaccu_b) =
-32 列 = 8 VGPR」推进（`oaccu_base = k_o_begin + col_idx*8`），
-16 个 D-iter × 8 = 128 ✓。
+1. **oaccu：`128 fp32/lane` → `[16, 512]/warp` → `[128, 512]/cta`，
+   是 PV 的累加结果（分子）。**
+
+   - warp i 拿 O 的行 [16i : 16(i+1))，全部 512 列——「×8」发生在 M 维。
+   - lane 级映射：矩阵乘是 v_mfma_f32_**16x16x32**_bf16，D tile 16×16。
+     标准 CDNA 布局是 lane = 16g+m 持有 D[4g:4g+4, m]（即 "[:4, 0]"）；
+     但本 kernel QK/PV 都**故意 swap 了 A/B**（K/V 当 A 操作数），所以在
+     [q行, 列] 坐标里正好是转置版：**lane l 持有 q 行 = l%16、
+     列 = 16t + 4·(l/16) + (0..3)**，t = 第几个 16×16 tile。
+   - 对 oaccu：t = 0..31（512/16 个 tile），每 lane 32×4 = 128 个 fp32，
+     列号从 4·(l/16) 起、步长 16，直到 512。同一 q 行由 l%16 相同的
+     4 个 lane 分摊（4 × 128 = 512 列）。
+   - 代码锚点：epilogue LSE 注释 "lanes 0..15 own the M-rows"（L944）
+     ⇒ q行 = lane%16；softmax 的 `col_0_idx = lane>>4` ⇒ 列组 = lane/16；
+     PV 的 D 循环按「(oaccu_a, oaccu_b) = 32 列 = 8 VGPR」推进
+     （`oaccu_base = k_o_begin + col_idx*8`），16 D-iter × 8 = 128 ✓。
+
+2. **O_running（= oaccu 里存的东西）是什么**：online softmax
+   （flash-attention）的「运行中的未归一化输出」。逐 tile 维护三个量——
+   行最大 `m`、行 exp 和 `l`（代码里的 `row_sum_e`）、输出累加 `O_acc`：
+
+   ```
+   m_new = max(m, rowmax(S_tile))
+   r     = exp(m − m_new)            # rescale；本 kernel 常被阈值 8 跳过
+   O_acc = O_acc · r + exp(S_tile − m_new) · V_tile
+   l     = l · r + rowsum(exp(S_tile − m_new))
+   最后一个 tile 之后：O = O_acc / l
+   ```
+
+   oaccu 一直存分子 `O_acc`；分母 `l` 是每 lane 一个标量（`row_sum_e`），
+   epilogue 才相除（§6.6）。
+
+3. **QK 的结果存在哪？** 需要寄存器，但只要 **16 个**——就是图里的
+   `p_comp`（v48–63）。逻辑上的 S 是 [16, T]/warp，永远**不整块物化**；
+   每个 iter 只存在当前 tile 的 S_tile [16 q行 × 64 KV列] =
+   1024 fp32 ÷ 64 lane = 16 VGPR。生命周期一条线：
+   QK mfma 写入 → softmax **原地**变 `exp(S−m)` → pack 成 bf16 挤进低半段
+   `p_mfma`（v48–55 overlay，体积减半）→ PV 当 B 操作数吃掉 →
+   下个 tile 复用这 16 个寄存器。这就是 online softmax 省寄存器的全部意义：
+   S 是瞬态、tile 大小的中间量，只有 O 和 (m, l) 需要跨 tile 存活。
+
 - `q_vgpr = 64`：16 × 512 bf16 = 8192 × 2 B ÷ 64 lane ÷ 4 B = 64。
 - `p_comp = 16`：64（KV 列）× 16（Q 行）fp32 ÷ 64 = 16。
 - 常见误算：`128 × 8 = 32 × 32`——「×8」其实发生在 **M 维**：8 个 warp
 各有一份互不重叠的 oaccu（不同的 16 行），合起来才是整个 block 的
-128 行 × 512 列输出，没有 32×32 的块。
+128 行 × 512 列输出，没有 32×32 的块；32 真正出现的地方是
+「每 warp 32 个 16×16 oaccu tile」。
 
 设计要点：寄存器**分时复用**——同一物理寄存器在 QK 阶段叫 `k_`*、PV 阶段叫
 `pv_v_*`；p_comp 的高段在 PV 时借给 V。整卡 0 spill。
