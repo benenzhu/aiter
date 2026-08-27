@@ -706,6 +706,111 @@ QK 期间叫 k_ring（装 K）、PV 期间叫 pv_v（装 V）；p_comp 在 softm
 
 → 深挖：spec Ch.6–7（Q 两阶段装载与 sb8 置换）、Ch.8.5–8.6（KV cvt+store 逐行）。
 
+## 2026-08-27 Q&A(3)：「温度」是什么 + LDS 布局复习 + pre-subtract 注释解读
+
+> 问题原文：① 伪代码里「乘温度」的温度是啥？② `QManager pre-subtracts up to
+> kLdsHeadPadBytes from p_lds_q ... Placing Q after both KV pongs gives that
+> subtraction enough headroom (m0 lands in KV-pong region, still valid LDS)`
+> 这段注释啥意思？③ LDS 怎么分配的，再复习一遍。
+
+### 1. 「温度」= softmax_scale（就是 attention 里的 1/√d）
+
+attention 的标准公式是 `S = Q·Kᵀ · sm_scale`，`sm_scale` 通常取 1/√d_qk
+（这里 1/√512 ≈ 0.0442，由 host 经 `params.softmax_scale` 传入，模型可能
+再乘自己的修正系数）。叫它「温度」是借用 softmax(x/τ) 里 τ 的说法：
+除以的数越大，softmax 出来的分布越平（和采样温度、蒸馏温度同源）——
+attention 用 1/√d 防止 d 很大时点积方差过大、softmax 饱和成 one-hot。
+
+本 kernel 的玩法是把它**提前乘进 Q**（L371）：
+
+```
+q_scale_log2 = softmax_scale × log2e          # log2e ≈ 1.4427
+```
+
+- 乘进 **Q 而不是 K**：数学上 `(aQ)·Kᵀ = a(Q·Kᵀ)`，随便选一边；但 Q 每个
+  work item 只装一次（16×512），K 每个 tile 都要装（64×512 × 很多 tile），
+  当然乘小的那份。NoPE 走 scaled-cvt 时直接把它并进 scale 操作数
+  （`e8m0 × q_scale_log2` 一次乘），RoPE 用 `scale_bf16_pair`。
+- 顺手再乘一个 **log2e**：这样 QK 出来的分数天然在 log2 域，softmax 的
+  `exp(x)` 全部变成硬件原生的 `exp2(x)`（`v_exp_f32` 本来就是以 2 为底），
+  每 tile 又省一次乘法。代价是边界处要换算：sink 进来时 `×log2e`（L889）、
+  LSE 写出时 `×1/log2e` 换回自然域（L955）。
+
+一句话：温度 = 1/√d 的缩放系数；本 kernel 把「温度 × 换底系数」一次性
+折进 Q，让整个热循环里既没有温度乘法也没有换底乘法。
+
+### 2. LDS 分配复习（合计 160 KB 恰好用满）
+
+launch 时按 `maxSharedMemoryPerMultiProcessor / kOccupancy` 要满 160 KB
+（MI350X 每 CU 的 LDS 上限；occupancy=1 → 本 workgroup 独占整块）。
+kernel 内手工切成 4 段（L234–237，顺序就是地址顺序）：
+
+```
+地址 0 ┌────────────────────────────┐
+       │ p_lds_kv_curr   64 KB      │ 当前 KV tile：64 行 × 512 列 bf16
+       │                            │ （sub-tile A 前 32 KB，B 后 32 KB）
+ 64 KB ├────────────────────────────┤
+       │ p_lds_kv_next   64 KB      │ 下一 tile 的 pong（Phase B 往这写）
+       │   (epilogue 时 = O bounce) │ 最后一个 iter 不再 swap → 区间已死,
+       │                            │ 借给输出做 swizzle 中转
+128 KB ├────────────────────────────┤
+       │ p_lds_q         16 KB      │ Q 装载区: 每 warp 2 KB 私有
+       │                            │ (staging → RoPE 复用同一块) —— 主循环内报废
+144 KB ├────────────────────────────┤
+       │ p_lds_kv_stage  16 KB      │ KV fp8 原始 staging: 2 个 slot × 8 KB
+       │                            │ (strip2 / strip3), 每 slot 内每 warp 1 KB
+160 KB └────────────────────────────┘
+```
+
+生命周期三种画风：两个 pong **常驻、每 iter 末尾 `std::swap` 指针**
+（swap 的是两个指针变量，数据不动）；Q 区只活在 prologue；stage 区每 iter
+重写。排序不是随意的，两条硬理由：
+
+1. **O bounce 必须盖在 `p_lds_kv_next` 上**（而不是 Q 区）：Q 区每 warp 的
+   步幅和 OManager 不一致，盖 Q 会跟下一个 work item 的 load_q 产生跨 warp
+   竞争；盖 next pong 则下个 work 的 KV prologue 写的是 curr，天然错开。
+2. **Q 必须排在高地址**——这就是第 3 问的 pre-subtract 需要的 headroom。
+
+### 3. pre-subtract 注释逐句解读
+
+背景硬件知识（两条）：
+
+- `buffer_load_*_lds` 是「vmem → LDS 直达」指令：LDS 目的基址放在 wave
+  一致的 **m0** 寄存器里，硬件固定给 lane T 的 16 B 写到 `m0 + imm + T×16`；
+- 指令编码里的立即数偏移 `imm` 会**同时**加到 vmem 源地址和 LDS 目的地址
+  两边（这是这条指令的固有行为，不可只加一边）。
+
+QManager Phase 1 想占 imm 的便宜：把 chunk 的列偏移
+`kColInRecord = chunk×64 B` 塞进 imm（manager L279 `async_load<16, kColInRecord>`），
+vmem 侧就省掉一次每 lane 的地址加法/一个地址 VGPR。副作用是 LDS 目的地址
+也被平移了 +kColInRecord——于是**预先从 LDS 基址里减掉它**：
+
+```
+LDS 基址(进 m0) = p_lds_warp_staging + kStagingI − kColInRecord   # L281
+硬件写入地址   = 上式 + kColInRecord + T×16 = 正确的 staging 位置  ✓
+```
+
+风险在哪：m0 是 32 位无符号。warp 0 的 staging 基址恰好等于 `p_lds_q + 0`
+——如果 p_lds_q 离 LDS 地址 0 太近（< 最大 kColInRecord），这个减法就
+**下溢绕回成巨大的数**，写 LDS 越界，硬件**静默丢弃**（不炸、不报错，
+数据无声消失，极难查）。解法就是布局顺序：把 Q 排在两个 64 KB pong 之后，
+p_lds_q = 128 KB 起步，headroom 远超需求；L229 的 static_assert 把
+「KV pongs 总量 ≥ kLdsHeadPadBytes」这个约束写死，谁改布局谁被编译器拦下。
+
+注释里 "m0 lands in KV-pong region, still valid LDS" 的意思：预减之后的
+**中间值**（还没加回 imm 时）落在 pong 的地址区间里——它只是个合法的
+32 位 LDS 地址中间量，硬件加回 imm 后真正写的还是 staging，**不会**碰
+pong 的数据。
+
+顺带一个数字勘误：kernel L204 注释写 "up to 192 B (kColInRecord =
+0/64/128/192)"、spec 6.4 也写 192——都是旧版数字（当年 4 个 chunk）。
+现行代码是 7 个 chunk（448 列 ÷ 64），kColInRecord 最大 6×64 = **384**，
+`kLdsHeadPadBytes = 6 × kP1ChunkCols = 384`（manager L475）。约束本身
+照样满足（headroom 是 128 KB 级别），只是注释数字没跟上。
+
+→ 深挖：spec Ch.6.3–6.4（Phase 1 逐行 + 本 trick 的 V32 渊源）、
+Ch.4（LDS 全章）。
+
 ## 2026-08-27 Q&A(3)：一篇「改名 + 切图」读代码方法论，对我们读 kernel 的启发
 
 > 背景：转来一篇文章，问它什么意思、对读这个 kernel 有啥启发。
