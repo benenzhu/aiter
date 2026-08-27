@@ -162,6 +162,23 @@ v 35┐
 v  0┘
 ```
 
+**寄存器算术**（这些数字怎么来的）：一个 VGPR = wave 里 64 个 lane 各 4 字节，
+所以一个 M×N 的 fp32 tile 摊到每 lane 要 **M·N/64** 个 VGPR（bf16 减半）。
+
+- `oaccu = 128`：它就是 **PV 的累加结果**——online-softmax 的未归一化运行输出
+  `O_running = Σ_tile exp(S − row_max)·V`，跨 KV tile 一直累加（偶尔乘
+  rescale），epilogue 才除以 `row_sum_e`。每个 warp 只管自己 16 行 Q：
+  16 × 512 fp32 = 8192 元素 ÷ 64 lane = 128 VGPR/lane。
+  内部结构是 **32 个 16×16 mfma 累加 tile**（512/16 = 32 个，每个占
+  256÷64 = 4 VGPR/lane）；PV 的 D 循环按「一对 (oaccu_a, oaccu_b) =
+  32 列 = 8 VGPR」推进（`oaccu_base = k_o_begin + col_idx*8`），
+  16 个 D-iter × 8 = 128 ✓。
+- `q_vgpr = 64`：16 × 512 bf16 = 8192 × 2 B ÷ 64 lane ÷ 4 B = 64。
+- `p_comp = 16`：64（KV 列）× 16（Q 行）fp32 ÷ 64 = 16。
+- 常见误算：`128 × 8 = 32 × 32`——「×8」其实发生在 **M 维**：8 个 warp
+  各有一份互不重叠的 oaccu（不同的 16 行），合起来才是整个 block 的
+  128 行 × 512 列输出，没有 32×32 的块。
+
 设计要点：寄存器**分时复用**——同一物理寄存器在 QK 阶段叫 `k_*`、PV 阶段叫
 `pv_v_*`；p_comp 的高段在 PV 时借给 V。整卡 0 spill。
 
