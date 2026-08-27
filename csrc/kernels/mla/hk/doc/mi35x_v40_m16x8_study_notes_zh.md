@@ -341,3 +341,33 @@ VGPR 里）；本 call 开头才 ds_read + cvt + 写进 **curr** pong ——把�
 - [ ] m16x4 变体 diff：为什么它放弃乒乓（occupancy=2 跨 workgroup 不可控，spec 10.5.1 末段），V1 manager 差在哪。
 - [ ] planner（metadata kernel）怎么切 split 与生成 work_info（`metadata/v1_2_device.cuh`）。
 - [ ] 性能数字：thread trace 里 QK/PV/搬运各占多少（spec Ch.1 perf state）。
+- [ ] HipKittens 的 art 实现：`hk::art` 怎么把 range 参数变成 inline asm 的
+      `v[..:..]` 操作数、`mma_ABt` 到 `v_mfma_*` 的映射（见附录）。
+
+---
+
+## 附录：HipKittens 源码地图
+
+kernel 里所有 `hk::` / `hkdart::` 原语来自 HipKittens（ThunderKittens 的 AMD
+版）。aiter JIT 默认从 `3rdparty/HipKittens` 引用（`aiter/jit/core.py:482`，
+env `HIP_KITTENS_DIR`），本仓库固定在 commit `d3cd9b31`。命名空间桥接在
+`hk_mla_utils.cuh:13`：`hk = kittens`，`hkdart = hk::ducks::art`。
+
+本 kernel 用到的构件 → HipKittens 内位置（均在 `include/cdna4/` 下）：
+
+| kernel 里的写法 | 定义处 | 说明 |
+|---|---|---|
+| `hk::art<T, M, N, layout, shape, ranges>` | `types/register/art.cuh` + `art_base.cuh` | assembly-mode 寄存器 tile：类型只是「视图」，物理寄存器由 ranges 模板参数指定 |
+| `hkdart::range / type_list / split_many_t` | `types/register/art.cuh`（`ducks::art` 命名空间开头） | 描述 VGPR 区段的类型级小语言 |
+| `hkdart::clobber<ranges>()` | `types/register/art.cuh` | 向编译器声明这些 VGPR 被占用 |
+| `hk::rt_16x32_s / rt_16x16_s` | `types/types.cuh:65` → `types/register/rt_shape.cuh` | mfma 基础 tile 形状（`_s` 是 shape 别名） |
+| `hk::mma_ABt(d, a, b[, c])` | `ops/warp/register/tile/assembly/mma.cuh` | art 版 mfma 封装（普通 rt 版在同级 `tile/mma.cuh`） |
+| `hk::mul_vgpr / hk::zero` | `ops/warp/register/tile/assembly/maps.cuh` | 对整段 pinned 区间的逐寄存器 map 操作 |
+| `hk::gl<T, ...>` | `types/global/gl.cuh` | global-memory tensor 描述符（traits 里的 `gl_q_nope` 等） |
+| `hk::st_fp8e4m3 / st_bf` + `st_16x16_s` | `types/shared/st.cuh` / `st_shape.cuh` | LDS tile 类型 |
+| `hk::group<N>` | `ops/group/group.cuh` | warp 组协作原语 |
+| `hk::bf16 / fp8e4m3 / u32x4` | `common/base_types.cuh` | 基础标量/打包类型 |
+
+阅读建议：先看 `art_base.cuh`（一个 art tile 怎么把 range 展开成 asm 操作数），
+再对照 `assembly/mma.cuh` 看一条 `mma_ABt` 最终吐出的 `v_mfma_f32_16x16x32_bf16`
+长什么样，之后回读 kernel 的 QK 循环会非常顺。
