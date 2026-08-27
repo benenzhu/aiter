@@ -589,3 +589,119 @@ online softmax 用「先欠账、后补乘」把它变成了流式的**——所
 softmax，softmax 一完就能 PV，p_comp 只需要装一个 tile。
 
 → 深挖：spec Ch.9（softmax 各函数逐行）、Ch.10.4.1（kDoRescale 两种实例）。
+
+## 2026-08-27 Q&A(2)：pinned 寄存器怎么用——去掉流水线的直筒版伪代码
+
+> 问题原文：oaccu / q_vgpr / p_comp / p_mfma / pv_v_0 / pv_v_2 / k_2 这些都是
+> 怎么用的？先不考虑流水线，排一下顺序。另外三个猜测求证：
+> ① g2s q_nope + s2r q_rope 直接读到 register？
+> ② q_nope 反量化后写进 q_vgpr，正好多少个 reg？
+> ③ g2s kv (fp8 with scale) 之后怎么转换来着？
+
+### 先回答三个猜测
+
+① **q_nope 猜对了一半，q_rope 猜反了半步**：
+   - q_nope：确实先 **g2s**（`buffer_load_lds_b128` 原始 fp8 → 每 warp 私有
+     staging LDS），但这只是中转——之后还要 **s2r + 反量化** 才进 q_vgpr。
+     走 LDS 一趟是为了把 lane 顺序摆成 mfma A 操作数要的样子。
+   - q_rope：不是 s2r 直读，是 **g2r**（16 B load 直达寄存器）→ 乘温度 →
+     **r2s** 写进 Q-LDS（写地址里做 sb8 置换 + 半行 swap，`p2_load_rope_chunk`）
+     → prologue 里再 **s2r** 到 v120–127。绕 LDS 一圈唯一的目的是做置换。
+
+② **q_nope 占 56 个，加 rope 8 个正好 64 = 填满 q_vgpr**：
+   448 列 × 16 行 × 2 B(bf16) ÷ 64 lane ÷ 4 B = **56**（v64–v119，
+   7 个 64 列 chunk × 8 reg）；rope 64 列 → 8 个（v120–v127）。
+
+③ **KV 的转换：一条 gfx950 新指令搞定**——`v_cvt_scalef32_pk_bf16_fp8`：
+   2×fp8 → 2×bf16 **顺带乘一个 float scale**，scale = `e8m0_to_f32(那 1 字节)`
+   （2^e 展开）。搬运通路是混合的：strip 0/1 走 **g2r**（`buffer_load_dwordx4`
+   "carrier"，16 fp8/lane 直达寄存器），strip 2/3 走 **g2s**（`buffer_load_lds`
+   → staging，再 s2r 出来）；两路都在寄存器里做 scaled-cvt，然后 **r2s**
+   `ds_write` 进 KV pong。两个注意点：
+   - KV 的 cvt **不乘** softmax_scale——温度只折进 Q（乘一次就够）；
+   - KV RoPE 是唯一纯 DMA 的：本来就是 bf16，`buffer_load_lds` 从 rope buffer
+     **直达 pong**，不过寄存器、不转换。
+
+### 直筒版伪代码（单 warp 视角，流水线全部拉直）
+
+```python
+# 记号: g=vmem  s=LDS  r=VGPR；"16 行"都指本 warp 自己那 16 行 Q / 16 行 KV band
+
+# ========== 0. Prologue: 装 Q（每个 work item 一次） ==========
+for c in range(7):                            # Q NoPE: 448 列 = 7 个 64 列 chunk
+    g2s: buffer_load_lds_b128   q_nope[16, 64c:64c+64](fp8) -> staging
+    g2r: buffer_load            该 chunk 的 e8m0 scale 字节  -> s_dw
+    s2r: ds_read_b64            staging -> 8 fp8/lane
+    cvt: v_cvt_scalef32_pk_bf16_fp8(fp8, e8m0(s_dw) * sm_scale*log2e)
+         -> q_vgpr[v64+8c : v64+8c+8]         # 反量化+乘温度一条指令完成
+# 7 chunk × 8 reg = v64..v119
+
+g2r: q_rope(bf16) -> u32x4                    # Q RoPE: 64 列
+r  : scale_bf16_pair(·, sm_scale*log2e)       # rope 也要乘温度
+r2s: ds_write_b128 -> Q-LDS                   # 地址里做 sb8 置换
+s2r: load_q_lds_to_gpr -> q_vgpr[v120:v128]
+# 至此 v64..v127 = 完整 Q[16,512] bf16, 主循环只读; Q-LDS 报废
+
+row_max, row_sum_e = -inf, 0                  # 每 lane 标量; oaccu 首个 PV 初始化
+
+# ========== 1. 逐个 64 行 KV tile ==========
+for tile in kv_tiles:
+    # ---- 1a. 搬运: fp8 KV -> bf16 KV pong(LDS), 本 warp 只管 16行×256列 band ----
+    row = resolve_row_kv_ld(tile)             # 查 page 表 -> 物理行号
+    g2r: buffer_load_dwordx4  strip0,1 fp8 -> carrier寄存器   (+各1字节 scale)
+    g2s: buffer_load_lds      strip2(,3 仅Lo) fp8 -> staging  (+scale)
+    if Hi: g2s: buffer_load_lds  kv_rope(bf16) -> pong 直达    # 纯 DMA
+    for strip in 自己的 fp8 strips:
+        r  : fp8 = carrier 或 ds_read(staging)
+        cvt: v_cvt_scalef32_pk_bf16_fp8(fp8, e8m0(scale))     # 不乘温度!
+        r2s: ds_write -> pong[本 band 位置]
+    barrier()                                 # 8 warp 拼齐 64×512 bf16 tile
+
+    # ---- 1b. QK: p_comp[64,16] = K_tile @ Q^T, 512 dim 全部收缩 ----
+    for c in range(16):                       # dim 512, 每段 32
+        for rg in range(4):                   # 64 kv 行, 每组 16
+            s2r: ds_read_b128  pong K 片段 -> k_ring        # v36/v40/v44 轮转
+            mma: v_mfma_f32_16x16x32_bf16(
+                     p_comp[rg] += k_ring @ q_vgpr[v64+4c : +4])
+                     # p_comp = v48..v63: 4 个 16×16 fp32 累加器
+    # 循环结束: p_comp = 本 tile 完整精确的 S_tile（dim 已收完, 见上一篇日志）
+
+    # ---- 1c. softmax(原地) + pack ----
+    mask -> max_16 -> warp_reduce -> 更新 row_max/rescale -> exp2 -> row_sum_e
+    pack: v_cvt_pk_bf16_f32  p_comp(16 fp32) -> p_mfma[v48:v56](16 bf16)
+    # p_comp 的 fp32 从此报废; v56..v63 空出来
+
+    # ---- 1d. PV: oaccu[16,512] += P[16,64] @ V_tile[64,512] ----
+    if do_rescale: oaccu *= rescale           # 实际拆成小段塞在 mfma 之间
+    for t in range(32):                       # 512 输出列, 每段 16
+        for half in (A, B):                   # kv 行 0:32 / 32:64
+            s2r: ds_read_b64_tr_b16  pong 转置读 V^T 片段
+                 -> pv_v 四槽轮转              # v60(pv_v_0)/v36/v40/v44 —— 借 k_ring!
+            mma: v_mfma_f32_16x16x32_bf16(
+                     oaccu[v128+4t : +4] += pv_v @ p_mfma[half])
+
+# ========== 2. Epilogue(最后一个 tile 之后) ==========
+row_sum_e += exp2(sink*log2e - row_max)       # 仅 final / 最后一个 split
+r  : oaccu *= 1/row_sum_e                     # v128..v255 全扫
+r2s: ds_write  oaccu -> O bounce LDS（盖在 next pong 上, 做 sb8 逆置换）
+s2r+g: ds_read -> buffer_store -> final_output(bf16) 或 split_output(fp32)+LSE
+```
+
+### 寄存器 ↔ 步骤对照
+
+| 寄存器 | 写它的步骤 | 读它的步骤 | 生命周期 |
+|---|---|---|---|
+| `q_vgpr` v64–127 | 0（装 Q） | 1b 每条 mma 的 B 操作数 | 整个 work item，只写一次 |
+| `k_0/1/2` v36–47 | 1b ds_read | 1b 紧跟的 mma | 一对 mfma 内（3 槽轮转） |
+| `p_comp` v48–63 | 1b mma 累加 | 1c softmax 原地 | 一个 tile |
+| `p_mfma` v48–55 | 1c pack | 1d PV 的 B 操作数 | 1c→1d（overlay 在 p_comp 上） |
+| `pv_v_0..3` v60,36,40,44 | 1d 转置 ds_read | 1d 紧跟的 mma | 一对 mfma 内（4 槽轮转，借 QK 的 k_ring + p_comp 顶部） |
+| `oaccu` v128–255 | 1d mma 累加 | 2 归一化+写出 | 整个 work item（跨 tile 存活） |
+
+一眼看懂复用逻辑：**QK 和 PV 永远不同时跑**，所以 v36–47 这 12 个寄存器在
+QK 期间叫 k_ring（装 K）、PV 期间叫 pv_v（装 V）；p_comp 在 softmax pack 完
+之后 fp32 内容报废，低 8 个被 bf16 的 P 覆盖（p_mfma）、顶上 4 个借给 V 槽。
+真正需要跨 tile 活着的只有 q_vgpr、oaccu 和 (row_max, row_sum_e) 两个标量——
+这正好呼应上一篇日志的结论。
+
+→ 深挖：spec Ch.6–7（Q 两阶段装载与 sb8 置换）、Ch.8.5–8.6（KV cvt+store 逐行）。
