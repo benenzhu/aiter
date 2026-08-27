@@ -93,3 +93,4 @@ aiter/ops/opus/configs/
 *.swo
 *.swp
 aiter/jit/flydsl_cache/
+3rdparty/HipKittens/
