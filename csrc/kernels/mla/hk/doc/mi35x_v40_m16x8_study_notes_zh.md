@@ -811,6 +811,83 @@ pong 的数据。
 → 深挖：spec Ch.6.3–6.4（Phase 1 逐行 + 本 trick 的 V32 渊源）、
 Ch.4（LDS 全章）。
 
+## 2026-08-27 Q&A(4)：Q RoPE 为什么要绕 LDS 一圈 + sb8 置换是什么
+
+> 问题原文：伪代码里 q_rope 走 `g2r → 乘温度 → r2s(ds_write, 地址里做 sb8
+> 置换) → s2r`——为什么需要这个（绕 LDS）？sb8 置换是什么？对应代码几行？
+
+### 1. 为什么 RoPE 不能 g2r 直达 q_vgpr——LDS 这一圈在干三件事
+
+**(a) lane 重排（核心原因）。** vmem 里 q_rope 是普通行主序
+[16 行 × 64 列 bf16]；而 mfma A 操作数要求的 fragment 是：
+**lane l 持有 (行 = l%16, D 段 = (l/16)×8 起的 8 个 bf16)**。
+两种「数据 → lane」的分配方式不同，中间隔着一次**跨 lane 的数据交换**。
+wave 内做任意 lane 重排的标准媒介就是 LDS：写侧按搬运最顺手的划分
+（lane>>2 = 行、lane&3 = 列组，每 lane 恰好 16 B 连续，`ds_write_b128`
+一条搞定），读侧按 mfma 想要的划分（lane%16 = 行）各自算地址读回来——
+重排在两次寻址的差里免费完成。寄存器内做同样的事得用一串
+`v_permlane`/`ds_bpermute`，又慢又占指令。
+
+**(b) 顺路做 sb8 置换（见 §2）。** K 在 KV pong 里的 D 轴是置换过的，
+Q 必须一模一样地置换，而置换本质是地址重排——正好搭在这次 LDS
+写地址上（零额外成本）。
+
+**(c) 顺路做 bank-conflict swizzle。** 行 4–7 / 12–15 的 32 B XOR
+half-swap（写侧 `col_quad_swz = col_quad ^ (S<<1)`，读侧同款 XOR），
+让读回的 `ds_read_b128` 在 64 bank 上无冲突。也是纯地址技巧，必须过 LDS。
+
+成本上这是 prologue 一次性的事（每 warp 2 KB、写读各一轮），摊到整个
+work item 几乎为零。
+
+### 2. sb8 置换是什么
+
+**定义**：sub-tile-of-8 permutation。把每个 64 列的 wave-tile 看成
+8 个 8 列的 sub-tile，存 LDS 时数据 sub-tile d 放到槽位
+`[0,4,1,5,2,6,3,7][d]`（等价说法：沿 LDS 槽位走，见到的数据 sub-tile
+顺序是 `[0,2,4,6,1,3,5,7]`）。位运算上是列索引 bit[5:3] 的 3-bit 旋转
+（p_bit3→L_bit5，p_bit4,5→L_bit3,4）。注意它**不是对合**——正逆两个
+表不同，读写两侧要各用各的。
+
+**为什么存在**：KV 的 cvt+store 写侧，64 列按自然顺序 `ds_write_b128`
+会撞 2-way bank conflict；按 sb8 打乱 8 列组的顺序后写读两侧都无冲突。
+纯粹是 LDS bank 工程，与数学无关。
+
+**为什么不破坏正确性**：QK 是沿 D 轴的归约
+`S = Σ_d Q[m,d]·K[n,d]`——加法交换律，D 轴以什么顺序被累加都行
+（浮点舍入顺序不同，和是等价的）。
+
+**但它有一条连锁反应链（理解本 kernel 布局的钥匙）**：
+
+```
+KV pong 的 D 轴按 sb8 存        （起因: 写侧 bank conflict）
+  → Q 的 D 轴必须同置换          （QK 每步 mfma 的 Q、K 必须用同一个 d;
+                                  只置换 K 不置换 Q 会算出 Q[m,k]·K[n,perm(k)], 全错)
+  → oaccu 的 512 个输出列被置换   （PV 时 V 的 D 轴不再是归约轴, 而是输出列轴!
+                                  归约轴换序无害的豁免在这里失效)
+  → epilogue 必须做 sb8⁻¹ 还原    （OManager 经 O bounce LDS 把列序还原后
+                                  才写 VRAM —— O bounce 存在的深层原因之一）
+```
+
+**容易漏的点**：不止 RoPE——**整个 Q 的 512 个 D 列都带 sb8**。NoPE 走
+Phase-1 staging→VGPR 时，同样的重排被烘进「chunk → 数据 sub-tile」的
+读取分配里，q_vgpr 里的列序和 KV pong 完全对齐。还有：kernel 并不真调用
+闭式函数 `sb8_perm_col_elems`，那只是参考实现；置换是**结构性**地烘进
+各处地址映射的（spec 7.2.3 的 Note）。
+
+### 3. 代码坐标（`hk_mla_v40_buffer_managers_gen1.cuh`）
+
+| 东西 | 行号 | 说明 |
+|---|---|---|
+| 置换的两个闭式（参考实现） | L30–52 | `sb8_perm_col_elems`（正）/ `sb8_inv_perm_col_elems`（逆），含正逆两张表的注释 |
+| Q RoPE 写侧 | L419–467 `p2_load_rope_chunk` | 注释 "Sub-tile-of-8 perm [0,2,4,6,1,3,5,7] (vmem-src side)"：LDS 槽 (sb=0,q) 收数据列 16q..+7、(sb=1,q) 收 16q+8..+15——lo 半取 gmem 偏移 0、hi 半取 +16；`col_quad_swz` 是 (c) 的 half-swap |
+| Q RoPE 读侧 | L585–624 `load_q_lds_to_gpr` | 平的 `ds_read_b128`（写侧已摆成 mfma A 布局）+ 读侧 XOR-32 swizzle；kernel 侧调用在主文件 L384–406（读进 v120–127） |
+| K RoPE（必须和 Q 同款） | L1028–1095 `prefetch_kv_rope` | 注释 "mirrors p2_load_rope_chunk"；`buffer_load_lds` 的 LDS 目的 pattern 是硬件定死的 lane T→T×16，所以置换等价地做在 **vmem 源偏移**上（kRopeColTileLo/Hi = 14/15、hi 半 −16 的把戏） |
+| K NoPE 写侧 | `store_kv_tile_step` 一族 | 置换烘进 wave→col-tile 划分与 store 地址（spec Ch.8.6） |
+| 逆置换（epilogue） | L1685、L1764、L1900、L1986–1991 | OManager 内联 `sb8_perm_subtile`；注释 "LDS sub-tile k holds data sub-tile sb8_inv(k)"——把 oaccu 的置换列序还原成自然序写 VRAM |
+
+→ 深挖：spec Ch.7.2 全节（闭式推导、正逆表、四个作用点的表格）、
+Ch.7.2.4（为什么"只置换 K"结构上不可能）、Ch.11.3（epilogue 逆置换逐行）。
+
 ## 2026-08-27 Q&A(3)：一篇「改名 + 切图」读代码方法论，对我们读 kernel 的启发
 
 > 背景：转来一篇文章，问它什么意思、对读这个 kernel 有啥启发。
