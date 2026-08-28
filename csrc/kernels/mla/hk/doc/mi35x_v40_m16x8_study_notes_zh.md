@@ -888,6 +888,70 @@ Phase-1 staging→VGPR 时，同样的重排被烘进「chunk → 数据 sub-til
 → 深挖：spec Ch.7.2 全节（闭式推导、正逆表、四个作用点的表格）、
 Ch.7.2.4（为什么"只置换 K"结构上不可能）、Ch.11.3（epilogue 逆置换逐行）。
 
+## 2026-08-27 Q&A(5)：`max_16` 逐行——row_max 的 lane 内一半
+
+> 问题：解释 softmax 里求 row_max 用的 `max_16`（`hk_mla_softmax.cuh` 里那段
+> 9 条指令的 inline asm）。
+
+### 它在整个 row_max 里的位置
+
+回忆 p_comp 的 per-lane 布局：**每个 lane 持有自己 q 行（lane%16）在本 tile
+里的 16 个 kv 列**（4 列一组 × 4 组，撒在 A/B 两个 sub-tile 里），存在
+16 个 pinned 寄存器 v48–v63。整行 64 列的 max 分两步：
+
+```
+① lane 内：max_16()          v48..v63 → 1 个标量        （本节主角，纯 VALU）
+② lane 间：warp_reduce<Max>  {l, l+16, l+32, l+48} 四个 lane 互并
+                             （它们持同一 q 行的另外三份 16 列）
+```
+
+### ① 的实现：max3 三叉树，9 条指令干完 16 选 1
+
+朴素写法是 15 条 `v_max_f32` 串成链——15 条指令、15 级串行依赖。这里用了
+AMD 的 **`v_max3_f32`（原生三输入 max，VOP3，一条指令一个周期档）** 搭树：
+
+```
+第 1 层（6 条，互相独立，可背靠背发射）：
+  t0 = max3(v48, v49, v50)     t1 = max3(v51, v52, v53)
+  t2 = max3(v54, v55, v56)     t3 = max3(v57, v58, v59)
+  t4 = max (v60, v61)          t5 = max (v62, v63)      ← 4×3 + 2×2 = 16 ✓
+第 2 层（2 条）：
+  t0 = max3(t0, t1, t4)        t1 = max3(t2, t3, t5)
+第 3 层（1 条）：
+  result = max(t0, t1)
+```
+
+9 条指令、依赖深度只有 3 层（对比链式的 15 层）。max 满足结合律+交换律，
+树形归约合法。理论下限是 8 条（每条 max3 消掉 2 个值、max 消 1 个，
+消 15 个值最少 7×max3+1×max），这里多花 1 条换了个完全对称、层内全独立
+的树——发射端友好。
+
+### inline asm 的机关（这个 codebase 的通用套路）
+
+- **为什么必须 asm**：源数据在 pinned 寄存器 v48–v63 里，是之前 mfma 用
+  asm 写的——编译器根本不知道这些寄存器有值。C++ 语法没法表达「从 48 号
+  物理寄存器读」，只能把**寄存器编号**当立即数拼进 asm 文本。
+- `"n"(GPR_START + k)`：`n` 约束 = 编译期整数字面量，在 asm 模板里以
+  `v[%7]`…`v[%22]` 的形式拼出 v[48]…v[63]。改一个模板参数 `GPR_START`
+  就能整体搬家（m16x4 的 p_comp 在 56，同一个函数直接复用）。
+- `"=v"(result), "=v"(t0)…`：输出让编译器在 scratch 区（v0–35）自己挑
+  6 个临时寄存器——pinned 与 scratch 两个世界在一条 asm 里各管各的。
+- `volatile`：真实依赖（v48–63 被前面的 mfma 写过）编译器看不见，volatile
+  保证这段不被删除、且不和其它 volatile asm（mfma、pack 等）乱序。
+
+### ② 的实现顺带说一句（`hk_mla_utils.cuh:369`）
+
+gfx950 上 warp_reduce 不走 LDS，用 **`v_permlane32_swap_b32` /
+`v_permlane16_swap_b32`**（跨 lane 寄存器半区互换）做两步蝶形：stride 32
+一步、stride 16 一步，`stop_stride = 15` 时到此为止——效果恰好是
+{l, l+16, l+32, l+48} 四个 lane 的值互相并起来，每个 lane 各留一份完整
+行 max 的副本（后面 exp、rescale 判定每 lane 都要用，冗余副本正好省广播）。
+技巧：把 val 同时喂给 swap 的两个操作数，swap 完 a/b 里一个是自己、一个是
+对家，`op(a,b)` 对 max（幂等）和 add（求和版复用同一函数）都正确。
+
+→ 深挖：spec Ch.9.3–9.4（softmax 归约全链路）、Ch.5.5（lane_idx cse-break
+惯用法，max_16 调用处附近同款）。
+
 ## 2026-08-27 Q&A(3)：一篇「改名 + 切图」读代码方法论，对我们读 kernel 的启发
 
 > 背景：转来一篇文章，问它什么意思、对读这个 kernel 有啥启发。
