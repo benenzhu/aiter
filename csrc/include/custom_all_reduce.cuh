@@ -1,4 +1,18 @@
 #pragma once
+#include <cstdlib>
+
+// The 2-stage fused allreduce+rmsnorm gathers the reduced slices by p2p reads (like
+// cross_device_reduce_2stage). AITER_AR_RMS_PUSH=1 restores the previous cross-device-store variant.
+static inline bool ar_rms_push()
+{
+    static int v = -1;
+    if(v < 0)
+    {
+        const char* e = getenv("AITER_AR_RMS_PUSH");
+        v = (e != nullptr && e[0] == '1') ? 1 : 0;
+    }
+    return v == 1;
+}
 /*
  * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (C) 2024-2026, The vLLM team.
@@ -1254,7 +1268,11 @@ __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(
 }
 
 // fused allreduce rmsnorm first step
-template <typename T, int ngpus>
+// PUSH=true : every rank writes its reduced slice into all ranks' tmp buffers (cross-device stores).
+// PUSH=false: every rank keeps its reduced slice in its own tmp buffer, then gathers the other
+//             slices with p2p reads (same scheme as cross_device_reduce_2stage). Either way each
+//             rank's tmp buffer ends up holding the whole reduced tensor for the norm stage.
+template <typename T, int ngpus, bool PUSH = true>
 __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     RankData* _dp,
     RankSignals sg,
@@ -1326,7 +1344,15 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
 
         // cross device store
         P rslt                           = *(reinterpret_cast<P*>(&tmp_smem[0]) + lane_id);
-        tmps[warp_id][rank * part + idx] = rslt;
+        if constexpr(PUSH)
+        {
+            tmps[warp_id][rank * part + idx] = rslt;
+        }
+        else
+        {
+            if(warp_id == 0)
+                tmps[rank][rank * part + idx] = rslt;
+        }
     }
     // NOTE: must use final_sync=false (RELEASE/ACQUIRE) here. Stage 2
     // (local_device_load_rmsnorm*) on each rank reads `tmps` on the
@@ -1337,6 +1363,20 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_cross_device_store(
     // output at per-rank volumes above ~1.2 MB (verified via
     // sglang/benchmark/kernels/all_reduce/repro_ar_rmsnorm_corruption.py).
     end_sync<ngpus, false>(sg, self_sg, rank);
+    if constexpr(!PUSH)
+    {
+        // stage 2: gather the other ranks' reduced slices into our own tmp buffer with p2p
+        // reads (thread group g reads rank g's slice; same tid mapping as stage 1 so the
+        // cross-device visibility argument of cross_device_reduce_2stage applies).
+        int src = warp_id;
+        if(src != rank)
+        {
+            for(int idx = tid; idx < part; idx += gridDim.x * tnum_gpu)
+            {
+                tmps[rank][src * part + idx] = tmps[src][src * part + idx];
+            }
+        }
+    }
 }
 
 template <int reduce_range>
@@ -4172,24 +4212,39 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
-    int block_num = ((size / world_size_) + 512 - 1) / 512;
+    const bool push_mode = ar_rms_push();
+    // pull mode: same grid as cross_device_reduce_2stage (packs per rank over 512/ngpus lanes)
+    int block_num = push_mode ? ((size / world_size_) + 512 - 1) / 512
+                             : ((size / pack_size) / world_size_ + (512 / world_size_) - 1) / (512 / world_size_);
     dim3 grid(std::min(block_num, 80));
     switch(world_size_)
     {
     case 8:
         MAYBE_DISPATCH_1S_KERNEL(8);
-        reduce_scatter_cross_device_store<T, 8>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        if(push_mode)
+            reduce_scatter_cross_device_store<T, 8, true>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        else
+            reduce_scatter_cross_device_store<T, 8, false>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     case 4:
         MAYBE_DISPATCH_1S_KERNEL(4);
-        reduce_scatter_cross_device_store<T, 4>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        if(push_mode)
+            reduce_scatter_cross_device_store<T, 4, true>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        else
+            reduce_scatter_cross_device_store<T, 4, false>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     case 2:
         MAYBE_DISPATCH_1S_KERNEL(2);
-        reduce_scatter_cross_device_store<T, 2>
-            <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        if(push_mode)
+            reduce_scatter_cross_device_store<T, 2, true>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
+        else
+            reduce_scatter_cross_device_store<T, 2, false>
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     default: throw std::runtime_error("fused allreduce rmsnorm: unsupported world_size=" + std::to_string(world_size_));
     }
